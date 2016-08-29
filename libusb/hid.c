@@ -22,8 +22,9 @@
  code repository located at:
         http://github.com/signal11/hidapi .
 ********************************************************/
-
-#define _GNU_SOURCE /* needed for wcsdup() before glibc 2.10 */
+#ifndef _GNU_SOURCE
+	#define _GNU_SOURCE /* needed for wcsdup() before glibc 2.10 */
+#endif
 
 /* C */
 #include <stdio.h>
@@ -138,6 +139,7 @@ instead to differentiate between interfaces on a composite HID device. */
 struct input_report {
 	uint8_t *data;
 	size_t len;
+	size_t index;
 	struct input_report *next;
 };
 
@@ -182,7 +184,7 @@ static int return_data(hid_device *dev, unsigned char *data, size_t length);
 
 static hid_device *new_hid_device(void)
 {
-	hid_device *dev = calloc(1, sizeof(hid_device));
+	hid_device *dev = (hid_device*)calloc(1, sizeof(hid_device));
 	dev->blocking = 1;
 
 	pthread_mutex_init(&dev->mutex, NULL);
@@ -563,7 +565,7 @@ struct hid_device_info  HID_API_EXPORT *hid_enumerate(unsigned short vendor_id, 
 							struct hid_device_info *tmp;
 
 							/* VID/PID match. Create the record. */
-							tmp = calloc(1, sizeof(struct hid_device_info));
+							tmp = (hid_device_info*)calloc(1, sizeof(struct hid_device_info));
 							if (cur_dev) {
 								cur_dev->next = tmp;
 							}
@@ -731,15 +733,16 @@ hid_device * hid_open(unsigned short vendor_id, unsigned short product_id, const
 
 static void read_callback(struct libusb_transfer *transfer)
 {
-	hid_device *dev = transfer->user_data;
+	hid_device *dev = (hid_device*)transfer->user_data;
 	int res;
 
 	if (transfer->status == LIBUSB_TRANSFER_COMPLETED) {
 
-		struct input_report *rpt = malloc(sizeof(*rpt));
-		rpt->data = malloc(transfer->actual_length);
+		struct input_report *rpt = (input_report*)calloc(1, sizeof(struct input_report));
+		rpt->data = (uint8_t*)malloc(transfer->actual_length);
 		memcpy(rpt->data, transfer->buffer, transfer->actual_length);
 		rpt->len = transfer->actual_length;
+		rpt->index = 0;
 		rpt->next = NULL;
 
 		pthread_mutex_lock(&dev->mutex);
@@ -763,9 +766,9 @@ static void read_callback(struct libusb_transfer *transfer)
 			/* Pop one off if we've reached 30 in the queue. This
 			   way we don't grow forever if the user never reads
 			   anything from the device. */
-			if (num_queued > 30) {
+			/*if (num_queued > 30) {
 				return_data(dev, NULL, 0);
-			}
+			}*/
 		}
 		pthread_mutex_unlock(&dev->mutex);
 	}
@@ -798,12 +801,12 @@ static void read_callback(struct libusb_transfer *transfer)
 
 static void *read_thread(void *param)
 {
-	hid_device *dev = param;
+	hid_device *dev = (hid_device*)param;
 	unsigned char *buf;
 	const size_t length = dev->input_ep_max_packet_size;
 
 	/* Set up the transfer object. */
-	buf = malloc(length);
+	buf = (unsigned char*)malloc(length);
 	dev->transfer = libusb_alloc_transfer(0);
 	libusb_fill_interrupt_transfer(dev->transfer,
 		dev->device_handle,
@@ -1057,9 +1060,28 @@ static int return_data(hid_device *dev, unsigned char *data, size_t length)
 	/* Copy the data out of the linked list item (rpt) into the
 	   return buffer (data), and delete the liked list item. */
 	struct input_report *rpt = dev->input_reports;
-	size_t len = (length < rpt->len)? length: rpt->len;
-	if (len > 0)
+	size_t len = (length < rpt->len) ? length: rpt->len;
+	/*if (len > 0) {
+		if (rpt->index) {
+			memcpy(data, rpt->data, 1);
+			memcpy(data+1, rpt->data + rpt->index, len-1);	
+		} else {
+			memcpy(data, rpt->data + rpt->index, len);
+		}
+		if (rpt->len > length) {
+			rpt->index += length;
+			rpt->len -= (length - 1);
+			return len;
+		}
+	}*/
+	if (len > 0) {
 		memcpy(data, rpt->data, len);
+		if (rpt->len > length) {
+			memcpy(rpt->data+1, rpt->data+len, rpt->len-len);
+			rpt->len -= (len - 1);
+			return len;
+		}
+	}
 	dev->input_reports = rpt->next;
 	free(rpt->data);
 	free(rpt);
@@ -1068,7 +1090,7 @@ static int return_data(hid_device *dev, unsigned char *data, size_t length)
 
 static void cleanup_mutex(void *param)
 {
-	hid_device *dev = param;
+	hid_device *dev = (hid_device*)param;
 	pthread_mutex_unlock(&dev->mutex);
 }
 
@@ -1203,6 +1225,7 @@ int HID_API_EXPORT hid_send_feature_report(hid_device *dev, const unsigned char 
 
 int HID_API_EXPORT hid_get_feature_report(hid_device *dev, unsigned char *data, size_t length)
 {
+	fflush(stdout);
 	int res = -1;
 	int skipped_report_id = 0;
 	int report_number = data[0];
@@ -1221,6 +1244,21 @@ int HID_API_EXPORT hid_get_feature_report(hid_device *dev, unsigned char *data, 
 		dev->interface,
 		(unsigned char *)data, length,
 		1000/*timeout millis*/);
+
+	if ( data[0] == 0x43 )
+	{
+		// Clear input reports
+		pthread_mutex_lock(&dev->mutex);
+		hid_device *temp = dev;
+		if (temp->input_reports)
+		{
+			temp->input_reports = temp->input_reports->next;
+			while (temp->input_reports) {
+				return_data(temp, NULL, 0);
+			}
+		}
+		pthread_mutex_unlock(&dev->mutex);
+	}
 
 	if (res < 0)
 		return -1;
@@ -1256,6 +1294,7 @@ void HID_API_EXPORT hid_close(hid_device *dev)
 
 	/* Clear out the queue of received reports. */
 	pthread_mutex_lock(&dev->mutex);
+
 	while (dev->input_reports) {
 		return_data(dev, NULL, 0);
 	}
